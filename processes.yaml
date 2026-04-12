@@ -1,0 +1,71 @@
+# Dev Process Manager — Application Registry
+# Grouped by life-os zone. Each app has a start command, working directory, and port.
+
+personal:
+  - id: weight-tracker
+    name: Weight Tracker
+    description: Bariatric weight dashboard + Chrome new-tab
+    dir: "E:\\Projects\\apleith\\weight-tracker"
+    command: "python run.py serve"
+    port: 8080
+    auto_start: true
+
+  - id: open-webui
+    name: Open WebUI
+    description: Free local LLM web interface (Docker)
+    dir: "D:\\hub\\projects\\open-webui-launcher"
+    command: "python -m common.launch_main"
+    port: 3000
+    auto_start: false
+
+  - id: dev-manager
+    name: Dev Manager
+    description: This process manager
+    dir: "E:\\Projects\\apleith\\dev-manager"
+    command: "python app.py"
+    port: 5050
+    auto_start: true
+
+professor:
+  - id: teachassist
+    name: TeachAssist
+    description: LLM-backed course builder
+    dir: "E:\\OneDrive\\Desktop\\course-builder"
+    command: "python app.py --web"
+    port: 5147
+    auto_start: false
+
+llc:
+  - id: ibis
+    name: Ibis
+    description: Local Whisper transcription app (dev mode)
+    dir: "E:\\Projects\\SIM-DAD\\ibis"
+    command: "python main.py --dev"
+    port: null
+    auto_start: false
+
+  - id: lector
+    name: Lector
+    description: Markdown editor with TTS
+    dir: "E:\\Projects\\SIM-DAD\\lector"
+    command: "python app.py"
+    port: 8501
+    auto_start: false
+
+  - id: tass
+    name: TASS
+    description: Text analysis desktop app
+    dir: "E:\\Projects\\SIM-DAD\\TASS"
+    command: "python main.py"
+    port: null
+    auto_start: false
+
+services:
+  - id: ollama
+    name: Ollama
+    description: Local LLM inference server
+    dir: null
+    command: null
+    port: 11434
+    managed: false
+    note: "Runs as Windows service — monitor only"
