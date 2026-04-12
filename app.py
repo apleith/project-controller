@@ -5,11 +5,15 @@ Groups apps by life-os zone (Personal, Professor, LLC, Services).
 Start, stop, and monitor processes from a single dashboard.
 """
 
+import collections
 import os
+import re
 import signal
 import subprocess
 import sys
+import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import psutil
@@ -24,10 +28,48 @@ app = Flask(__name__)
 # Track processes we've started (pid -> app_id)
 managed_pids: dict[str, int] = {}
 
+# Process log buffers: app_id -> deque of log lines
+LOG_MAX_LINES = 200
+process_logs: dict[str, collections.deque] = {}
+
+# Auto-restart tracking: app_id -> {retries, last_crash, disabled}
+MAX_RETRIES = 3
+RETRY_WINDOW = 300  # seconds — reset retry count after this many seconds without a crash
+restart_state: dict[str, dict] = {}
+
 
 def load_registry() -> dict:
     with open(REGISTRY_PATH, encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def parse_status_md(path: Path) -> dict | None:
+    """Parse a project STATUS.md into a dict of key fields."""
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    result = {}
+    for key in ("id", "status", "next_action", "blockers", "last_session"):
+        match = re.search(rf"^{key}:\s*(.+)$", text, re.MULTILINE)
+        if match:
+            result[key] = match.group(1).strip()
+    # Extract project name from heading
+    heading = re.search(r"^#\s+(.+?)(?:\s*—|\s*$)", text, re.MULTILINE)
+    if heading:
+        result["project_name"] = heading.group(1).strip()
+    return result if result else None
+
+
+def get_project_state(app_cfg: dict) -> dict | None:
+    """Read STATUS.md from an app's directory."""
+    work_dir = app_cfg.get("dir")
+    if not work_dir:
+        return None
+    status_path = Path(work_dir) / "STATUS.md"
+    return parse_status_md(status_path)
 
 
 def find_process_on_port(port: int) -> dict | None:
@@ -106,7 +148,7 @@ def dashboard():
 
 @app.route("/api/status")
 def api_status():
-    """Return status of all registered apps."""
+    """Return status of all registered apps, including project state and logs."""
     registry = load_registry()
     zones = {}
     for zone_id, apps in registry.items():
@@ -115,7 +157,14 @@ def api_status():
         zone_apps = []
         for a in apps:
             status = get_app_status(a)
-            zone_apps.append({**a, **status})
+            project = get_project_state(a) or {}
+            log_lines = list(process_logs.get(a.get("id", ""), []))
+            zone_apps.append({
+                **a,
+                **status,
+                "project": project,
+                "log_tail": log_lines[-50:],  # last 50 lines for UI
+            })
         zones[zone_id] = zone_apps
     return jsonify(zones)
 
@@ -149,16 +198,7 @@ def api_start(app_id):
         return jsonify({"error": "Already running", "pid": status["pid"]}), 409
 
     try:
-        # Start the process detached
-        proc = subprocess.Popen(
-            command,
-            shell=True,
-            cwd=work_dir,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
-        )
-        managed_pids[app_id] = proc.pid
+        proc = _start_process(app_id, command, work_dir)
         # Give it a moment to bind the port
         time.sleep(1.5)
         new_status = get_app_status(app_cfg)
@@ -294,6 +334,172 @@ def api_kill_stale():
     return jsonify({"ok": True, "killed": killed})
 
 
+def _start_process(app_id: str, command: str, work_dir: str) -> subprocess.Popen:
+    """Start a process with log capture. Returns the Popen object."""
+    if app_id not in process_logs:
+        process_logs[app_id] = collections.deque(maxlen=LOG_MAX_LINES)
+
+    proc = subprocess.Popen(
+        command,
+        shell=True,
+        cwd=work_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    managed_pids[app_id] = proc.pid
+
+    # Background thread to read stdout and store in log buffer
+    def _reader():
+        try:
+            for line in proc.stdout:
+                ts = datetime.now().strftime("%H:%M:%S")
+                process_logs[app_id].append(f"[{ts}] {line.rstrip()}")
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# Logs API
+# ---------------------------------------------------------------------------
+@app.route("/api/logs/<app_id>")
+def api_logs(app_id):
+    """Return full log buffer for an app."""
+    lines = list(process_logs.get(app_id, []))
+    return jsonify({"app_id": app_id, "lines": lines, "count": len(lines)})
+
+
+@app.route("/api/logs/<app_id>/clear", methods=["POST"])
+def api_clear_logs(app_id):
+    """Clear log buffer for an app."""
+    if app_id in process_logs:
+        process_logs[app_id].clear()
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Health check endpoint
+# ---------------------------------------------------------------------------
+@app.route("/api/health")
+def api_health():
+    """Return a JSON summary of all app statuses — for external integrations."""
+    registry = load_registry()
+    total = 0
+    running = 0
+    apps_summary = []
+    for zone_id, apps in registry.items():
+        if not isinstance(apps, list):
+            continue
+        for a in apps:
+            total += 1
+            status = get_app_status(a)
+            if status["running"]:
+                running += 1
+            project = get_project_state(a) or {}
+            apps_summary.append({
+                "id": a.get("id"),
+                "name": a.get("name"),
+                "zone": zone_id,
+                "running": status["running"],
+                "pid": status.get("pid"),
+                "uptime": status.get("uptime"),
+                "project_status": project.get("status"),
+                "next_action": project.get("next_action"),
+            })
+    return jsonify({
+        "healthy": running > 0,
+        "total": total,
+        "running": running,
+        "stopped": total - running,
+        "timestamp": datetime.now().isoformat(),
+        "apps": apps_summary,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Auto-restart watchdog
+# ---------------------------------------------------------------------------
+def _watchdog():
+    """Background thread that monitors auto_start apps and restarts on crash."""
+    time.sleep(10)  # let Flask boot first
+    while True:
+        try:
+            registry = load_registry()
+            for zone_id, apps in registry.items():
+                if not isinstance(apps, list):
+                    continue
+                for a in apps:
+                    if not a.get("auto_start"):
+                        continue
+                    if a.get("managed") is False:
+                        continue
+                    app_id = a.get("id", "")
+                    command = a.get("command")
+                    work_dir = a.get("dir")
+                    if not command or not work_dir:
+                        continue
+
+                    status = get_app_status(a)
+                    if status["running"]:
+                        # Running — reset retry state
+                        if app_id in restart_state:
+                            rs = restart_state[app_id]
+                            if time.time() - rs.get("last_crash", 0) > RETRY_WINDOW:
+                                rs["retries"] = 0
+                        continue
+
+                    # Not running — check if we should restart
+                    if app_id not in restart_state:
+                        restart_state[app_id] = {"retries": 0, "last_crash": 0, "disabled": False}
+                    rs = restart_state[app_id]
+
+                    if rs["disabled"]:
+                        continue
+
+                    # Reset retries if outside the window
+                    if time.time() - rs.get("last_crash", 0) > RETRY_WINDOW:
+                        rs["retries"] = 0
+
+                    if rs["retries"] >= MAX_RETRIES:
+                        rs["disabled"] = True
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        if app_id not in process_logs:
+                            process_logs[app_id] = collections.deque(maxlen=LOG_MAX_LINES)
+                        process_logs[app_id].append(
+                            f"[{ts}] WATCHDOG: {a.get('name')} crashed {MAX_RETRIES} times in {RETRY_WINDOW}s — auto-restart disabled"
+                        )
+                        continue
+
+                    # Restart it
+                    rs["retries"] += 1
+                    rs["last_crash"] = time.time()
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    if app_id not in process_logs:
+                        process_logs[app_id] = collections.deque(maxlen=LOG_MAX_LINES)
+                    process_logs[app_id].append(
+                        f"[{ts}] WATCHDOG: {a.get('name')} not running — restarting (attempt {rs['retries']}/{MAX_RETRIES})"
+                    )
+                    try:
+                        _start_process(app_id, command, work_dir)
+                    except Exception as e:
+                        process_logs[app_id].append(f"[{ts}] WATCHDOG: restart failed — {e}")
+        except Exception:
+            pass
+        time.sleep(15)
+
+
+# Start watchdog thread
+_watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+_watchdog_thread.start()
+
+
 TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -341,12 +547,15 @@ h1 { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
 .zone-llc .zone-dot { background: var(--purple); }
 .zone-services .zone-dot { background: var(--text-muted); }
 
-.app-row {
-  display: flex; align-items: center; gap: 12px;
-  padding: 10px 14px; background: var(--surface); border: 1px solid var(--border);
+.app-card {
+  background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--radius); margin-bottom: 6px; transition: border-color 0.15s;
 }
-.app-row:hover { border-color: #3a3a4a; }
+.app-card:hover { border-color: #3a3a4a; }
+.app-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 14px; cursor: pointer; user-select: none;
+}
 .app-status { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .app-status.running { background: var(--green); box-shadow: 0 0 6px var(--green); }
 .app-status.stopped { background: var(--red); opacity: 0.4; }
@@ -354,12 +563,34 @@ h1 { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
 .app-info { flex: 1; min-width: 0; }
 .app-name { font-size: 14px; font-weight: 600; }
 .app-desc { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
+.app-project { margin-top: 4px; font-size: 11px; }
+.app-project .proj-status { padding: 1px 6px; border-radius: 3px; font-weight: 600; font-size: 10px; text-transform: uppercase; }
+.proj-status.active { background: var(--green-bg); color: var(--green); }
+.proj-status.blocked { background: var(--red-bg); color: var(--red); }
+.proj-status.deferred { background: var(--yellow-bg); color: var(--yellow); }
+.proj-next { color: var(--text-muted); margin-left: 6px; }
 .app-meta { display: flex; gap: 16px; font-size: 11px; color: var(--text-muted); flex-shrink: 0; }
 .app-meta span { white-space: nowrap; }
 .app-port { font-family: var(--mono); font-size: 11px; color: var(--blue); }
 .app-pid { font-family: var(--mono); font-size: 11px; }
 .app-uptime { color: var(--green); }
 .app-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.app-detail {
+  display: none; padding: 0 14px 10px 36px;
+  border-top: 1px solid var(--border);
+}
+.app-detail.open { display: block; }
+.log-panel {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 8px 10px; margin-top: 6px; max-height: 200px; overflow-y: auto;
+  font-family: var(--mono); font-size: 11px; line-height: 1.5; color: var(--text-muted);
+  white-space: pre-wrap; word-break: break-all;
+}
+.log-panel:empty::after { content: "No logs captured yet."; font-style: italic; }
+.log-toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
+.detail-row { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.detail-row strong { color: var(--text); }
+.blocker-tag { color: var(--red); font-weight: 600; }
 
 .btn {
   padding: 5px 12px; font-size: 11px; font-weight: 600; border: 1px solid var(--border);
@@ -425,6 +656,7 @@ async function refresh() {
 
 function render(zones) {
   let totalApps = 0, runningApps = 0;
+  let blockerCount = 0;
   let html = '';
 
   for (const [zoneId, apps] of Object.entries(zones)) {
@@ -437,23 +669,46 @@ function render(zones) {
       if (a.running) runningApps++;
       const isManaged = a.managed !== false;
       const statusClass = !isManaged ? 'unmanaged' : a.running ? 'running' : 'stopped';
+      const p = a.project || {};
+      const projStatus = p.status || '';
+      const projClass = projStatus === 'blocked' ? 'blocked' : projStatus === 'deferred' ? 'deferred' : projStatus ? 'active' : '';
+      if (projStatus === 'blocked') blockerCount++;
+      const hasBlocker = p.blockers && p.blockers !== 'none' && p.blockers !== 'None';
+      const logLines = (a.log_tail || []);
 
-      html += `<div class="app-row">
-        <div class="app-status ${statusClass}"></div>
-        <div class="app-info">
-          <div class="app-name">${a.name}</div>
-          <div class="app-desc">${a.description || ''}</div>
+      html += `<div class="app-card" id="card-${a.id}">
+        <div class="app-row" onclick="toggleDetail('${a.id}')">
+          <div class="app-status ${statusClass}"></div>
+          <div class="app-info">
+            <div class="app-name">${a.name}</div>
+            <div class="app-desc">${a.description || ''}</div>
+            ${projStatus ? `<div class="app-project">
+              <span class="proj-status ${projClass}">${projStatus}</span>
+              ${p.next_action ? `<span class="proj-next">${truncate(p.next_action, 90)}</span>` : ''}
+            </div>` : ''}
+          </div>
+          <div class="app-meta">
+            ${a.port ? `<span class="app-port">:${a.port}</span>` : ''}
+            ${a.running ? `<span class="app-pid">PID ${a.pid}</span>` : ''}
+            ${a.uptime ? `<span class="app-uptime">${a.uptime}</span>` : ''}
+          </div>
+          <div class="app-actions" onclick="event.stopPropagation()">
+            ${a.running && a.port ? `<button class="btn btn-open" onclick="window.open('http://localhost:${a.port}')">Open</button>` : ''}
+            ${isManaged && !a.running ? `<button class="btn btn-start" onclick="startApp('${a.id}')">Start</button>` : ''}
+            ${isManaged && a.running ? `<button class="btn btn-stop" onclick="stopApp('${a.id}')">Stop</button><button class="btn btn-danger" onclick="killApp('${a.id}', '${a.name}')">Kill</button>` : ''}
+            ${!isManaged ? `<span style="font-size:10px;color:var(--text-muted)">monitor only</span>` : ''}
+          </div>
         </div>
-        <div class="app-meta">
-          ${a.port ? `<span class="app-port">:${a.port}</span>` : ''}
-          ${a.running ? `<span class="app-pid">PID ${a.pid}</span>` : ''}
-          ${a.uptime ? `<span class="app-uptime">${a.uptime}</span>` : ''}
-        </div>
-        <div class="app-actions">
-          ${a.running && a.port ? `<button class="btn btn-open" onclick="window.open('http://localhost:${a.port}')">Open</button>` : ''}
-          ${isManaged && !a.running ? `<button class="btn btn-start" onclick="startApp('${a.id}')">Start</button>` : ''}
-          ${isManaged && a.running ? `<button class="btn btn-stop" onclick="stopApp('${a.id}')">Stop</button><button class="btn btn-danger" onclick="killApp('${a.id}', '${a.name}')">Kill</button>` : ''}
-          ${!isManaged ? `<span style="font-size:10px;color:var(--text-muted)">monitor only</span>` : ''}
+        <div class="app-detail" id="detail-${a.id}">
+          ${p.project_name ? `<div class="detail-row"><strong>Project:</strong> ${p.project_name} (${p.id || ''})</div>` : ''}
+          ${p.last_session ? `<div class="detail-row"><strong>Last session:</strong> ${p.last_session}</div>` : ''}
+          ${hasBlocker ? `<div class="detail-row"><strong>Blocker:</strong> <span class="blocker-tag">${p.blockers}</span></div>` : ''}
+          ${p.next_action ? `<div class="detail-row"><strong>Next action:</strong> ${p.next_action}</div>` : ''}
+          <div class="log-toolbar">
+            <strong style="font-size:11px;">Process Logs</strong>
+            <button class="btn" style="padding:2px 8px;font-size:10px;" onclick="clearLogs('${a.id}')">Clear</button>
+          </div>
+          <div class="log-panel" id="log-${a.id}">${logLines.map(escHtml).join('\\n')}</div>
         </div>
       </div>`;
     }
@@ -461,11 +716,42 @@ function render(zones) {
   }
 
   document.getElementById('zones').innerHTML = html;
+  // Restore open panels
+  for (const id of openPanels) {
+    const el = document.getElementById('detail-' + id);
+    if (el) el.classList.add('open');
+  }
   document.getElementById('summary').innerHTML = `
     <div class="summary-card"><span class="num">${totalApps}</span>registered</div>
     <div class="summary-card running"><span class="num">${runningApps}</span>running</div>
     <div class="summary-card"><span class="num">${totalApps - runningApps}</span>stopped</div>
+    ${blockerCount ? `<div class="summary-card" style="border-color:rgba(239,68,68,0.3)"><span class="num" style="color:var(--red)">${blockerCount}</span>blocked</div>` : ''}
   `;
+}
+
+const openPanels = new Set();
+
+function toggleDetail(id) {
+  const el = document.getElementById('detail-' + id);
+  if (!el) return;
+  el.classList.toggle('open');
+  if (el.classList.contains('open')) openPanels.add(id);
+  else openPanels.delete(id);
+}
+
+function truncate(s, n) {
+  return s.length > n ? s.slice(0, n) + '...' : s;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function clearLogs(id) {
+  await fetch('/api/logs/' + id + '/clear', { method: 'POST' });
+  const el = document.getElementById('log-' + id);
+  if (el) el.textContent = '';
+  toast('Logs cleared for ' + id);
 }
 
 async function startApp(id) {
