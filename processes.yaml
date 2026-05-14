@@ -26,6 +26,23 @@ personal:
     port: 5050
     auto_start: true
 
+  - id: life-os-bridge
+    name: life-os-bridge
+    description: Mobile bridge — phone-reachable health/scale/activity submission + ntfy prompt engine
+    dir: "E:\\Projects\\apleith\\life-os-bridge"
+    command: "python app.py"
+    port: 5151
+    auto_start: true
+
+  - id: ghostwriter
+    name: Ghostwriter
+    description: Multi-register voice-profile-aware ghostwriter (Tauri desktop, PERS-010). Stage 1 shipped 2026-05-11. Do not use for public-facing drafts until Stage 5 ships.
+    dir: "E:\\Projects\\apleith\\ghostwriter"
+    command: "npm run tauri dev"
+    port: null
+    auto_start: false
+    note: "Tauri desktop app with Python FastAPI sidecar; sidecar port is dynamic (printed on stdout). Dev manager tracks process presence, not port. Vite dev URL is http://localhost:1420 during dev mode."
+
 professor:
   - id: teachassist
     name: TeachAssist
@@ -40,32 +57,61 @@ llc:
     name: Ibis
     description: Local Whisper transcription app (dev mode)
     dir: "E:\\Projects\\SIM-DAD\\ibis"
-    command: "python main.py --dev"
+    command: "E:\\Projects\\SIM-DAD\\ibis\\venv\\Scripts\\pythonw.exe main.py --dev"
     port: null
     auto_start: false
 
   - id: lector
     name: Lector
-    description: Markdown editor with TTS
+    description: Markdown editor with TTS (post-Tauri-pivot; shares venv + USER_DATA_DIR with launch.bat)
     dir: "E:\\Projects\\SIM-DAD\\lector"
-    command: "python app.py"
-    port: 8501
+    command: 'set "LECTOR_PRODUCTION=1" && set "LECTOR_SKIP_TTS_PRELOAD=1" && "%LOCALAPPDATA%\Lector\.venv\Scripts\python.exe" server.py'
+    port: 7860
     auto_start: false
 
   - id: tass
     name: TASS
     description: Text analysis desktop app
-    dir: "E:\\Projects\\SIM-DAD\\TASS"
-    command: "python main.py"
+    dir: "E:\\Projects\\SIM-DAD\\tass"
+    command: "E:\\Projects\\SIM-DAD\\tass\\.venv\\Scripts\\python.exe main.py"
     port: null
     auto_start: false
 
 services:
-  - id: ollama
-    name: Ollama
-    description: Local LLM inference server
+  - id: vllm-heavy
+    name: vLLM (Qwen3-30B)
+    description: Local LLM serving — Qwen3-30B-A3B-Instruct-2507-AWQ on RTX 3090
+    dir: "E:\\Projects\\apleith\\vllm-serving"
+    command: "powershell -ExecutionPolicy Bypass -File start.ps1"
+    port: 8000
+    auto_start: true
+    note: "Cold-start ~30-60s. Must come up before LiteLLM. Health: GET http://localhost:8000/v1/models"
+
+  - id: litellm-proxy
+    name: LiteLLM Proxy
+    description: Routing layer — local-heavy / local-fast / claude-fallback aliases
+    dir: "E:\\Projects\\apleith\\litellm-proxy"
+    command: "powershell -ExecutionPolicy Bypass -File start.ps1"
+    port: 4000
+    auto_start: true
+    depends_on: vllm-heavy
+    note: "Health: GET http://localhost:4000/health/readiness"
+
+  - id: langfuse
+    name: Langfuse
+    description: LLM tracing for cost + quality measurement
+    dir: null
+    command: null
+    port: 3030
+    managed: false
+    note: "Runs as Docker container. Monitor only. Restart via docker compose if down."
+
+  - id: ollama-deprecated
+    name: Ollama (deprecated 2026-05-07)
+    description: Replaced by vLLM. Kept as monitor-only in case any legacy script still pings it.
     dir: null
     command: null
     port: 11434
     managed: false
-    note: "Runs as Windows service — monitor only"
+    auto_start: false
+    note: "DEPRECATED. Do not autostart. Remove this entry once /audit confirms no live references in life-os scripts (Task 0.4)."
