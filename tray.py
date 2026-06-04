@@ -26,6 +26,53 @@ REGISTRY_PATH = BASE_DIR / "processes.yaml"
 PORT = 5050
 DASHBOARD_URL = f"http://127.0.0.1:{PORT}"
 
+# Machine modes — canonical actuator is the engine script in life-os.
+MODE_FILE = Path(r"C:\life-os\meta\state\machine-mode.json")
+NO_LOCAL_FLAG = Path(r"C:\life-os\meta\state\no-local-mode.flag")
+MODE_SCRIPT = Path(r"C:\life-os\meta\scripts\machine-mode.ps1")
+FOCUS_SCRIPT = Path(r"C:\life-os\meta\scripts\focus-mode.ps1")
+MODE_LABELS = {"normal": "Normal", "no-local": "No-Local", "vr": "VR"}
+
+
+def current_mode() -> str:
+    import json
+
+    try:
+        if MODE_FILE.exists():
+            data = json.loads(MODE_FILE.read_text(encoding="utf-8"))
+            return data.get("mode") or "normal"
+    except Exception:
+        pass
+    try:
+        if NO_LOCAL_FLAG.exists():
+            return "no-local"
+    except Exception:
+        pass
+    return "normal"
+
+
+def _launch_detached_ps(script: Path, args: list) -> None:
+    import subprocess as sp
+
+    cmd = ["powershell.exe", "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", str(script)] + args
+    try:
+        sp.Popen(
+            cmd,
+            creationflags=sp.CREATE_NEW_PROCESS_GROUP | sp.CREATE_NO_WINDOW,
+            stdout=sp.DEVNULL,
+            stderr=sp.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def set_mode_action(mode: str) -> None:
+    _launch_detached_ps(MODE_SCRIPT, ["-Mode", mode])
+
+
+def reclaim_vram_action() -> None:
+    _launch_detached_ps(FOCUS_SCRIPT, [])
+
 
 # ---------------------------------------------------------------------------
 # Registry + status helpers (duplicated from app.py to avoid circular imports)
@@ -210,9 +257,25 @@ def build_menu():
     }
 
     total, running, apps = get_all_status()
+    mode = current_mode()
+
+    mode_menu = pystray.Menu(
+        *[
+            pystray.MenuItem(
+                MODE_LABELS[m],
+                (lambda _, mm=m: set_mode_action(mm)),
+                checked=(lambda item, mm=m: current_mode() == mm),
+                radio=True,
+            )
+            for m in ("normal", "no-local", "vr")
+        ],
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Reclaim GPU VRAM (focus)", lambda _: reclaim_vram_action()),
+    )
 
     items = [
         pystray.MenuItem(f"Dev Manager — {running}/{total} running", open_dashboard, default=True),
+        pystray.MenuItem(f"Mode: {MODE_LABELS.get(mode, mode)} ▸", mode_menu),
         pystray.Menu.SEPARATOR,
     ]
 
