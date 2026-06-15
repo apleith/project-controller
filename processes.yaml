@@ -26,11 +26,11 @@ personal:
     port: 5050
     auto_start: true
 
-  - id: life-os-bridge
-    name: life-os-bridge
-    description: Mobile bridge — phone-reachable health/scale/activity submission + ntfy prompt engine
-    dir: "E:\\Projects\\apleith\\life-os-bridge"
-    command: "python app.py"
+  - id: cairn
+    name: Cairn
+    description: Unified bariatric + GLP-1 + general health tracker. Phone-reachable Flask + PWA + ntfy prompt engine. Renamed 2026-05-22 from life-os-bridge.
+    dir: "E:\\Projects\\apleith\\cairn"
+    command: ".venv\\Scripts\\python.exe app.py"
     port: 5151
     auto_start: true
 
@@ -42,6 +42,14 @@ personal:
     port: null
     auto_start: false
     note: "Tauri desktop app with Python FastAPI sidecar; sidecar port is dynamic (printed on stdout). Dev manager tracks process presence, not port. Vite dev URL is http://localhost:1420 during dev mode."
+
+  - id: vr-work-bridge
+    name: VR Work Bridge
+    description: VR life-os status panel + OVR Toolkit headset notifications (PERS, heading to AURA Lab). Panel http://127.0.0.1:8770/, OVRT custom app "life-os".
+    dir: "E:\\Projects\\apleith\\vr-work-bridge"
+    command: "C:\\Users\\alexl\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe app.py"
+    port: 8770
+    auto_start: true
 
 professor:
   - id: teachassist
@@ -85,6 +93,7 @@ services:
     command: "powershell -ExecutionPolicy Bypass -File start.ps1"
     port: 8000
     auto_start: true
+    local_llm: true   # watchdog skips this when no-local-mode flag is set
     note: "Cold-start ~30-60s. Must come up before LiteLLM. Health: GET http://localhost:8000/v1/models"
 
   - id: litellm-proxy
@@ -94,6 +103,7 @@ services:
     command: "powershell -ExecutionPolicy Bypass -File start.ps1"
     port: 4000
     auto_start: true
+    local_llm: true   # watchdog skips this when no-local-mode flag is set
     depends_on: vllm-heavy
     note: "Health: GET http://localhost:4000/health/readiness"
 
