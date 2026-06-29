@@ -37,6 +37,69 @@ MAX_RETRIES = 3
 RETRY_WINDOW = 300  # seconds — reset retry count after this many seconds without a crash
 restart_state: dict[str, dict] = {}
 
+# "No-local" mode: when this flag file exists, the watchdog will NOT auto-start
+# (or auto-restart) any app tagged `local_llm: true` in processes.yaml. Lets the
+# owner keep life-os + dashboards live while the local LLM stack stays down
+# (e.g. to free the GPU/RAM). Toggle via C:\life-os\meta\scripts\no-local-mode.ps1.
+NO_LOCAL_FLAG = Path(r"C:\life-os\meta\state\no-local-mode.flag")
+
+# Machine modes (normal | no-local | vr). The engine script is the canonical actuator; Dev
+# Manager just reads state and launches it. See
+# C:\life-os\meta\scripts\machine-mode.ps1 and the design spec under docs/superpowers/specs/.
+MODE_FILE = Path(r"C:\life-os\meta\state\machine-mode.json")
+MODE_SCRIPT = Path(r"C:\life-os\meta\scripts\machine-mode.ps1")
+FOCUS_SCRIPT = Path(r"C:\life-os\meta\scripts\focus-mode.ps1")
+GPU_STATUS_SCRIPT = Path(r"C:\life-os\meta\scripts\gpu-status.ps1")
+VALID_MODES = ("normal", "no-local", "vr")
+
+# Processes the GPU-hog stop endpoint refuses to kill, even if they pin the GPU. Mirrors the
+# $Protected list in gpu-status.ps1 — desktop compositor, shell, session-critical bits.
+GPU_PROTECTED = {
+    "dwm", "explorer", "csrss", "winlogon", "wininit", "services", "lsass", "fontdrvhost",
+    "shellexperiencehost", "searchhost", "startmenuexperiencehost", "textinputhost", "sihost",
+    "ctfmon", "dllhost", "shellhost", "systemsettings", "applicationframehost",
+}
+
+
+def no_local_mode() -> bool:
+    try:
+        return NO_LOCAL_FLAG.exists()
+    except Exception:
+        return False
+
+
+def current_mode() -> dict:
+    """Read the active machine mode from machine-mode.json, inferring legacy state."""
+    import json
+
+    try:
+        if MODE_FILE.exists():
+            data = json.loads(MODE_FILE.read_text(encoding="utf-8"))
+            mode = data.get("mode") or "normal"
+            return {
+                "mode": mode,
+                "status": data.get("status", "active"),
+                "entered_at": data.get("enteredAt"),
+                "quieted_tasks": data.get("disabledByMode", []),
+            }
+    except Exception:
+        pass
+    # No state file: infer from the flag (pre-engine / hand-set state).
+    if no_local_mode():
+        return {"mode": "no-local", "status": "active", "entered_at": None, "quieted_tasks": []}
+    return {"mode": "normal", "status": "active", "entered_at": None, "quieted_tasks": []}
+
+
+def _launch_detached_ps(script: Path, args: list[str]) -> None:
+    """Fire-and-forget a PowerShell script with no console window."""
+    cmd = ["powershell.exe", "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", str(script)] + args
+    subprocess.Popen(
+        cmd,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
 
 def load_registry() -> dict:
     with open(REGISTRY_PATH, encoding="utf-8") as f:
@@ -345,7 +408,11 @@ def _start_process(app_id: str, command: str, work_dir: str) -> subprocess.Popen
         cwd=work_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        # CREATE_NO_WINDOW: spawned PowerShell/cmd children run headless; no
+        # visible console window pops up. Without this, dev-manager spawned
+        # from tray still gives each child a fresh console. Added 2026-05-14
+        # so vLLM and LiteLLM stop cluttering the taskbar.
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -382,6 +449,94 @@ def api_clear_logs(app_id):
     if app_id in process_logs:
         process_logs[app_id].clear()
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Machine mode endpoints (normal | no-local | vr)
+# ---------------------------------------------------------------------------
+@app.route("/api/mode")
+def api_mode():
+    """Return the active machine mode."""
+    return jsonify(current_mode())
+
+
+@app.route("/api/mode/<mode>", methods=["POST"])
+def api_set_mode(mode):
+    """Switch machine mode by launching the engine script detached."""
+    if mode not in VALID_MODES:
+        return jsonify({"error": f"Unknown mode '{mode}'", "valid": list(VALID_MODES)}), 400
+    if not MODE_SCRIPT.exists():
+        return jsonify({"error": f"Engine script not found: {MODE_SCRIPT}"}), 500
+    try:
+        _launch_detached_ps(MODE_SCRIPT, ["-Mode", mode])
+        return jsonify({"ok": True, "mode": mode, "status": "applying"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/reclaim-vram", methods=["POST"])
+def api_reclaim_vram():
+    """One-shot: close GUI VRAM nibblers for a heavy local-LLM session (focus-mode)."""
+    if not FOCUS_SCRIPT.exists():
+        return jsonify({"error": f"Focus script not found: {FOCUS_SCRIPT}"}), 500
+    try:
+        _launch_detached_ps(FOCUS_SCRIPT, [])
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gpu")
+def api_gpu():
+    """Live GPU VRAM + non-managed processes pinning the GPU (via gpu-status.ps1).
+
+    Surfaces ad-hoc GPU jobs (Orator renders, games, encoders) the mode system does NOT
+    manage, so VR mode doesn't falsely promise a free GPU. Read-only.
+    """
+    import json
+
+    if not GPU_STATUS_SCRIPT.exists():
+        return jsonify({"error": "gpu-status.ps1 not found", "vram": None, "hogs": []}), 200
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", str(GPU_STATUS_SCRIPT), "-MinUtil", "20", "-Samples", "2"],
+            capture_output=True, text=True, timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        data = json.loads(out.stdout) if out.stdout.strip() else {"vram": None, "hogs": []}
+        # Normalize hogs to a list (ConvertTo-Json emits a single object, not a list, for one item).
+        hogs = data.get("hogs") or []
+        if isinstance(hogs, dict):
+            hogs = [hogs]
+        data["hogs"] = hogs
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e), "vram": None, "hogs": []}), 200
+
+
+@app.route("/api/gpu/stop/<int:proc_id>", methods=["POST"])
+def api_gpu_stop(proc_id):
+    """Stop a specific GPU-hogging process by PID. Refuses protected/system processes."""
+    try:
+        proc = psutil.Process(proc_id)
+        name = (proc.name() or "").lower().replace(".exe", "")
+        if name in GPU_PROTECTED:
+            return jsonify({"error": f"Refusing to stop protected process '{name}'"}), 400
+        if proc_id == os.getpid():
+            return jsonify({"error": "Refusing to stop Dev Manager itself"}), 400
+        for child in proc.children(recursive=True):
+            try:
+                child.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        proc.kill()
+        proc.wait(timeout=5)
+        return jsonify({"ok": True, "killed": proc_id, "name": name})
+    except psutil.NoSuchProcess:
+        return jsonify({"error": "Process no longer running"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +594,9 @@ def _watchdog():
                     if not a.get("auto_start"):
                         continue
                     if a.get("managed") is False:
+                        continue
+                    # No-local mode: leave local LLM services down.
+                    if a.get("local_llm") and no_local_mode():
                         continue
                     app_id = a.get("id", "")
                     command = a.get("command")
@@ -547,37 +705,59 @@ h1 { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
 .zone-llc .zone-dot { background: var(--purple); }
 .zone-services .zone-dot { background: var(--text-muted); }
 
+.app-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 10px;
+}
 .app-card {
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); margin-bottom: 6px; transition: border-color 0.15s;
+  border-radius: var(--radius);
+  display: flex; flex-direction: column;
+  transition: border-color 0.15s;
+  overflow: hidden;
 }
 .app-card:hover { border-color: #3a3a4a; }
-.app-row {
-  display: flex; align-items: center; gap: 12px;
-  padding: 10px 14px; cursor: pointer; user-select: none;
+.app-card-main {
+  display: flex; flex-direction: column;
+  padding: 12px 14px; gap: 8px;
+  cursor: pointer; user-select: none;
+  flex: 1;
+}
+.app-card-header {
+  display: flex; align-items: center; gap: 10px;
 }
 .app-status { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .app-status.running { background: var(--green); box-shadow: 0 0 6px var(--green); }
 .app-status.stopped { background: var(--red); opacity: 0.4; }
 .app-status.unmanaged { background: var(--text-muted); }
-.app-info { flex: 1; min-width: 0; }
-.app-name { font-size: 14px; font-weight: 600; }
-.app-desc { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
-.app-project { margin-top: 4px; font-size: 11px; }
-.app-project .proj-status { padding: 1px 6px; border-radius: 3px; font-weight: 600; font-size: 10px; text-transform: uppercase; }
+.app-name { font-size: 14px; font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-port {
+  font-family: var(--mono); font-size: 11px; color: var(--blue);
+  padding: 2px 6px; background: var(--blue-bg); border-radius: 3px;
+  flex-shrink: 0;
+}
+.app-desc { font-size: 11px; color: var(--text-muted); line-height: 1.4; }
+.app-project { font-size: 11px; display: flex; align-items: flex-start; gap: 6px; flex-wrap: wrap; }
+.app-project .proj-status { padding: 1px 6px; border-radius: 3px; font-weight: 600; font-size: 10px; text-transform: uppercase; flex-shrink: 0; }
 .proj-status.active { background: var(--green-bg); color: var(--green); }
 .proj-status.blocked { background: var(--red-bg); color: var(--red); }
 .proj-status.deferred { background: var(--yellow-bg); color: var(--yellow); }
-.proj-next { color: var(--text-muted); margin-left: 6px; }
-.app-meta { display: flex; gap: 16px; font-size: 11px; color: var(--text-muted); flex-shrink: 0; }
-.app-meta span { white-space: nowrap; }
-.app-port { font-family: var(--mono); font-size: 11px; color: var(--blue); }
+.proj-next { color: var(--text-muted); line-height: 1.4; }
+.app-card-footer {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 14px; gap: 8px;
+  border-top: 1px solid var(--border); background: rgba(0,0,0,0.15);
+}
+.app-meta { display: flex; gap: 10px; font-size: 11px; color: var(--text-muted); min-width: 0; }
+.app-meta span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .app-pid { font-family: var(--mono); font-size: 11px; }
 .app-uptime { color: var(--green); }
-.app-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.app-actions { display: flex; gap: 6px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+.app-unmanaged-tag { font-size: 10px; color: var(--text-muted); font-style: italic; }
 .app-detail {
-  display: none; padding: 0 14px 10px 36px;
-  border-top: 1px solid var(--border);
+  display: none; padding: 10px 14px;
+  border-top: 1px solid var(--border); background: rgba(0,0,0,0.2);
 }
 .app-detail.open { display: block; }
 .log-panel {
@@ -621,6 +801,50 @@ h1 { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
   font-size: 12px; color: var(--text); box-shadow: 0 4px 12px rgba(0,0,0,0.3);
   z-index: 100; display: none;
 }
+
+/* Machine mode bar */
+.mode-bar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 12px 16px; margin-bottom: 20px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.mode-bar.mode-no-local { border-color: rgba(234,179,8,0.5); background: var(--yellow-bg); }
+.mode-bar.mode-vr { border-color: rgba(168,85,247,0.6); background: var(--purple-bg); }
+.mode-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); }
+.mode-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.mode-seg button {
+  padding: 6px 14px; font-size: 12px; font-weight: 600; border: none; cursor: pointer;
+  background: var(--surface2); color: var(--text-muted); border-right: 1px solid var(--border);
+}
+.mode-seg button:last-child { border-right: none; }
+.mode-seg button:hover { color: var(--text); }
+.mode-seg button.active { color: #fff; }
+.mode-seg button.active[data-mode="normal"] { background: var(--green); }
+.mode-seg button.active[data-mode="no-local"] { background: var(--yellow); color: #1a1a24; }
+.mode-seg button.active[data-mode="vr"] { background: var(--purple); }
+.mode-seg button:disabled { opacity: 0.6; cursor: wait; }
+.mode-applying { font-size: 11px; color: var(--yellow); font-style: italic; }
+.mode-note { font-size: 11px; color: var(--text-muted); flex: 1; min-width: 160px; }
+.mode-spacer { flex: 1; }
+
+/* GPU status + hog warnings */
+.gpu-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 8px 16px; margin-bottom: 16px; font-size: 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.gpu-bar.busy { border-color: rgba(234,179,8,0.45); }
+.gpu-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); }
+.gpu-meter { font-family: var(--mono); color: var(--text-muted); }
+.gpu-hog {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 3px 8px; border-radius: 4px; background: var(--yellow-bg);
+  color: var(--yellow); font-size: 11px;
+}
+.gpu-hog .gpu-cmd { color: var(--text-muted); font-family: var(--mono); max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gpu-hog.protected { background: rgba(107,112,136,0.15); color: var(--text-muted); }
+.btn-stopgpu { padding: 2px 8px; font-size: 10px; color: var(--red); border-color: rgba(239,68,68,0.3); }
+.btn-stopgpu:hover { background: var(--red-bg); }
 </style>
 </head>
 <body>
@@ -631,11 +855,14 @@ h1 { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
     <div class="subtitle">Local process manager for life-os</div>
   </div>
   <div class="toolbar-right">
+    <a class="btn" href="http://nsf-leith:5151/today" target="_blank" rel="noopener" style="text-decoration:none;display:inline-flex;align-items:center;">Today</a>
     <button class="btn btn-danger" onclick="killStale()">Kill Stale Processes</button>
     <button class="btn" onclick="refresh()">Refresh</button>
   </div>
 </div>
 
+<div class="mode-bar" id="mode-bar"></div>
+<div id="gpu-status"></div>
 <div class="summary" id="summary"></div>
 <div id="zones"></div>
 <div class="toast" id="toast"></div>
@@ -652,6 +879,127 @@ async function refresh() {
   const resp = await fetch('/api/status');
   const zones = await resp.json();
   render(zones);
+  refreshMode();
+  refreshGpu();
+}
+
+async function refreshGpu() {
+  try {
+    const resp = await fetch('/api/gpu');
+    const g = await resp.json();
+    renderGpu(g);
+  } catch (e) { /* leave last render */ }
+}
+
+function renderGpu(g) {
+  const el = document.getElementById('gpu-status');
+  const v = g.vram;
+  const hogs = g.hogs || [];
+  if (!v && hogs.length === 0) { el.innerHTML = ''; return; }
+  const usedGb = v ? (v.usedMiB / 1024).toFixed(1) : '?';
+  const totGb = v ? (v.totalMiB / 1024).toFixed(0) : '?';
+  let meter = v ? `${usedGb} / ${totGb} GB VRAM · compute ${v.computeUtil}%` : 'GPU info unavailable';
+  let hogHtml = '';
+  for (const h of hogs) {
+    const cmd = h.cmd ? `<span class="gpu-cmd" title="${escHtml(h.cmd)}">${escHtml(h.cmd)}</span>` : '';
+    const stop = h.protected
+      ? ''
+      : `<button class="btn btn-stopgpu" onclick="stopGpuJob(${h.pid}, '${escHtml(h.name)}')">Stop</button>`;
+    hogHtml += `<span class="gpu-hog${h.protected ? ' protected' : ''}">${escHtml(h.name)} (PID ${h.pid}) ${h.util}% ${h.engine}${cmd ? ' · ' + cmd : ''} ${stop}</span>`;
+  }
+  el.innerHTML = `<div class="gpu-bar${hogs.length ? ' busy' : ''}">
+    <span class="gpu-label">GPU</span>
+    <span class="gpu-meter">${meter}</span>
+    ${hogs.length ? hogHtml : '<span style="color:var(--green)">free of non-managed jobs</span>'}
+  </div>`;
+}
+
+async function stopGpuJob(pid, name) {
+  if (!confirm(`Stop "${name}" (PID ${pid})? If this is a render or a remote session, that work/connection will be lost.`)) return;
+  toast('Stopping ' + name + '…');
+  try {
+    const resp = await fetch('/api/gpu/stop/' + pid, { method: 'POST' });
+    const data = await resp.json();
+    toast(data.ok ? name + ' stopped' : 'Error: ' + data.error);
+  } catch (e) { toast('Error: ' + e); }
+  setTimeout(refreshGpu, 800);
+}
+
+const MODE_META = {
+  'normal':   { label: 'Normal',   note: 'Everything runs. Local LLMs watchdog-managed.' },
+  'no-local': { label: 'No-Local', note: 'Local LLMs off + pinned. life-os fully live.' },
+  'vr':       { label: 'VR',       note: 'GPU freed for VR (vLLM down), pop-up tasks quieted. Dev Manager, cairn, Discord stay up.' },
+};
+
+let modeBusy = false;
+
+async function refreshMode() {
+  if (modeBusy) return;
+  try {
+    const resp = await fetch('/api/mode');
+    const m = await resp.json();
+    renderMode(m);
+  } catch (e) { /* leave last render */ }
+}
+
+function renderMode(m) {
+  const bar = document.getElementById('mode-bar');
+  const cur = m.mode || 'normal';
+  const applying = m.status === 'applying';
+  bar.className = 'mode-bar mode-' + cur;
+  let seg = '';
+  for (const id of ['normal', 'no-local', 'vr']) {
+    const active = id === cur ? ' active' : '';
+    const dis = (applying || modeBusy) ? ' disabled' : '';
+    seg += `<button class="${active.trim()}" data-mode="${id}"${dis} onclick="setMode('${id}')">${MODE_META[id].label}</button>`;
+  }
+  bar.innerHTML = `
+    <span class="mode-label">Machine Mode</span>
+    <div class="mode-seg">${seg}</div>
+    ${applying ? '<span class="mode-applying">switching…</span>' : ''}
+    <span class="mode-note">${MODE_META[cur].note}</span>
+    <button class="btn btn-open" ${applying ? 'disabled' : ''} onclick="reclaimVram()">Reclaim GPU VRAM</button>
+  `;
+}
+
+async function setMode(mode) {
+  if (modeBusy) return;
+  const cur = document.querySelector('.mode-seg button.active');
+  if (cur && cur.dataset.mode === mode) { toast('Already in ' + MODE_META[mode].label + ' mode'); return; }
+  if (mode === 'vr' && !confirm('Switch to VR mode? Stops vLLM (frees ~23GB VRAM) and quiets pop-up tasks. Dev Manager stays up.')) return;
+  modeBusy = true;
+  toast('Switching to ' + MODE_META[mode].label + '… (vLLM reload can take 30-90s on the way back)');
+  try {
+    const resp = await fetch('/api/mode/' + mode, { method: 'POST' });
+    const data = await resp.json();
+    if (!data.ok) toast('Error: ' + data.error);
+  } catch (e) { toast('Error: ' + e); }
+  // Poll mode until it settles to active, then release the lock.
+  setTimeout(() => { modeBusy = false; pollModeUntilActive(0); }, 1500);
+}
+
+async function pollModeUntilActive(tries) {
+  try {
+    const resp = await fetch('/api/mode');
+    const m = await resp.json();
+    renderMode(m);
+    if (m.status === 'applying' && tries < 40) {
+      setTimeout(() => pollModeUntilActive(tries + 1), 3000);
+    } else {
+      toast('Mode: ' + (MODE_META[m.mode] ? MODE_META[m.mode].label : m.mode));
+      refresh();
+    }
+  } catch (e) { /* ignore */ }
+}
+
+async function reclaimVram() {
+  if (!confirm('Close GUI VRAM nibblers (Discord, Edge WebView, Parsec, NVIDIA Broadcast, PowerToys, etc.) to free VRAM for a heavy local-LLM session?')) return;
+  toast('Reclaiming GPU VRAM…');
+  try {
+    const resp = await fetch('/api/reclaim-vram', { method: 'POST' });
+    const data = await resp.json();
+    toast(data.ok ? 'Closing GUI VRAM apps…' : 'Error: ' + data.error);
+  } catch (e) { toast('Error: ' + e); }
 }
 
 function render(zones) {
@@ -663,6 +1011,7 @@ function render(zones) {
     const label = ZONE_LABELS[zoneId] || zoneId;
     html += `<div class="zone zone-${zoneId}">`;
     html += `<div class="zone-header"><span class="zone-dot"></span>${label}</div>`;
+    html += `<div class="app-grid">`;
 
     for (const a of apps) {
       totalApps++;
@@ -677,26 +1026,29 @@ function render(zones) {
       const logLines = (a.log_tail || []);
 
       html += `<div class="app-card" id="card-${a.id}">
-        <div class="app-row" onclick="toggleDetail('${a.id}')">
-          <div class="app-status ${statusClass}"></div>
-          <div class="app-info">
+        <div class="app-card-main" onclick="toggleDetail('${a.id}')">
+          <div class="app-card-header">
+            <div class="app-status ${statusClass}"></div>
             <div class="app-name">${a.name}</div>
-            <div class="app-desc">${a.description || ''}</div>
-            ${projStatus ? `<div class="app-project">
-              <span class="proj-status ${projClass}">${projStatus}</span>
-              ${p.next_action ? `<span class="proj-next">${truncate(p.next_action, 90)}</span>` : ''}
-            </div>` : ''}
-          </div>
-          <div class="app-meta">
             ${a.port ? `<span class="app-port">:${a.port}</span>` : ''}
+          </div>
+          ${a.description ? `<div class="app-desc">${a.description}</div>` : ''}
+          ${projStatus ? `<div class="app-project">
+            <span class="proj-status ${projClass}">${projStatus}</span>
+            ${p.next_action ? `<span class="proj-next">${truncate(p.next_action, 110)}</span>` : ''}
+          </div>` : ''}
+        </div>
+        <div class="app-card-footer">
+          <div class="app-meta">
             ${a.running ? `<span class="app-pid">PID ${a.pid}</span>` : ''}
             ${a.uptime ? `<span class="app-uptime">${a.uptime}</span>` : ''}
+            ${!isManaged ? `<span class="app-unmanaged-tag">monitor only</span>` : ''}
+            ${isManaged && !a.running ? `<span style="color:var(--text-muted)">stopped</span>` : ''}
           </div>
           <div class="app-actions" onclick="event.stopPropagation()">
             ${a.running && a.port ? `<button class="btn btn-open" onclick="window.open('http://localhost:${a.port}')">Open</button>` : ''}
             ${isManaged && !a.running ? `<button class="btn btn-start" onclick="startApp('${a.id}')">Start</button>` : ''}
             ${isManaged && a.running ? `<button class="btn btn-stop" onclick="stopApp('${a.id}')">Stop</button><button class="btn btn-danger" onclick="killApp('${a.id}', '${a.name}')">Kill</button>` : ''}
-            ${!isManaged ? `<span style="font-size:10px;color:var(--text-muted)">monitor only</span>` : ''}
           </div>
         </div>
         <div class="app-detail" id="detail-${a.id}">
@@ -712,7 +1064,7 @@ function render(zones) {
         </div>
       </div>`;
     }
-    html += '</div>';
+    html += '</div></div>';
   }
 
   document.getElementById('zones').innerHTML = html;
